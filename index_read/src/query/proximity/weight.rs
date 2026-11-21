@@ -16,7 +16,7 @@
 // along with this program. If not, see <http://www.gnu.org/licenses/>.
 
 use crate::query::proximity::query::ProximityQuery;
-use crate::query::proximity::scorer::ProximityScorer;
+use crate::query::proximity::scorer::{InnerMatches, ProxSide, ProximityScorer};
 use crate::query::proximity::{ProxTermStyle, ProximityClause, WhichTerms};
 use std::sync::Arc;
 use tantivy::fieldnorm::FieldNormReader;
@@ -60,98 +60,73 @@ impl ProximityWeight {
             .map(|bm25_weight| bm25_weight.boost_by(boost));
         let fieldnorm_reader = self.fieldnorm_reader(reader)?;
 
-        let left_postings =
-            self.read_postings(reader, self.query.left(), WhichTerms::Left, false)?;
-        if left_postings.is_empty() {
+        let left = self.read_side(reader, self.query.left(), WhichTerms::Left)?;
+        if left.is_empty() {
             return Ok(None);
         }
-        let right_postings =
-            self.read_postings(reader, self.query.right(), WhichTerms::Right, false)?;
-        if right_postings.is_empty() {
+        let right = self.read_side(reader, self.query.right(), WhichTerms::Right)?;
+        if right.is_empty() {
             return Ok(None);
         }
 
         Ok(Some(ProximityScorer::new(
-            left_postings,
+            left,
             self.query.distance(),
-            right_postings,
+            right,
             fieldnorm_reader,
             weight_opt,
             reader.max_doc(),
+            false,
         )))
     }
 
-    fn read_postings(
+    fn read_side(
         &self,
         segment_reader: &SegmentReader,
         clause: &ProximityClause,
         which_terms: WhichTerms,
-        nested: bool,
-    ) -> tantivy::Result<Vec<Box<dyn Postings>>> {
+    ) -> tantivy::Result<ProxSide> {
         if let ProximityClause::Proximity {
             left,
             distance,
             right,
         } = clause
         {
-            let query =
-                ProximityQuery::new(self.query.field(), *left.clone(), *distance, *right.clone());
-            let weight = ProximityWeight::new(query, self.weight_opt.clone());
-            let left_postings = weight.read_postings(segment_reader, left, which_terms, true)?;
-            let right_postings = weight.read_postings(segment_reader, right, which_terms, true)?;
-
+            let left = self.read_side(segment_reader, left, which_terms)?;
+            let right = self.read_side(segment_reader, right, which_terms)?;
             let mut scorer = ProximityScorer::new(
-                left_postings,
+                left,
                 *distance,
-                right_postings,
+                right,
                 self.fieldnorm_reader(segment_reader)?,
                 self.weight_opt.clone(),
                 segment_reader.max_doc(),
+                true,
             );
 
-            let mut doc_ids = Vec::new();
+            let mut matches = InnerMatches::default();
             let mut fieldnorms = Vec::new();
-            let mut positions = Vec::new();
-            let mut offsets = Vec::new();
+            let mut doc_spans = Vec::new();
             while scorer.doc() != TERMINATED {
-                offsets.push(positions.len() as u32);
-                doc_ids.push(scorer.doc());
+                matches.offsets.push(matches.spans.len() as u32);
+                matches.doc_ids.push(scorer.doc());
                 if self.weight_opt.is_some() {
                     fieldnorms.push(scorer.fieldnorm_id());
                 }
 
-                for (l, r) in scorer.prox_iter() {
-                    if nested {
-                        match which_terms {
-                            // *** NOTICE! ***
-                            //
-                            // these are *purposely* reversed.  If we're nested and the user is asking
-                            // for postings on the left-side of a proximity query what *we* need to
-                            // return are the postings from the right side
-                            WhichTerms::Left => positions.push(r),
-
-                            // same goes for the right-side, just in reverse
-                            WhichTerms::Right => positions.push(l),
-
-                            // gotta collect 'em all
-                            WhichTerms::All => {
-                                positions.push(l);
-                                positions.push(r);
-                            }
-                        }
-                    } else {
-                        positions.push(l);
-                        positions.push(r);
-                    }
-                }
+                doc_spans.clear();
+                doc_spans.extend(scorer.prox_iter().map(|(l, r)| l.cover(r)));
+                doc_spans.sort_unstable();
+                doc_spans.dedup();
+                matches.spans.extend_from_slice(&doc_spans);
                 scorer.advance();
             }
-            offsets.push(positions.len() as u32);
+            matches.offsets.push(matches.spans.len() as u32);
 
-            let loaded_postings = LoadedPostings {
-                doc_ids: doc_ids.into_boxed_slice(),
-                position_offsets: offsets.into_boxed_slice(),
-                positions: positions.into_boxed_slice(),
+            let postings = LoadedPostings {
+                doc_ids: matches.doc_ids.clone().into_boxed_slice(),
+                position_offsets: vec![0; matches.doc_ids.len() + 1].into_boxed_slice(),
+                positions: Box::default(),
                 cursor: 0,
                 fieldnorms: self
                     .weight_opt
@@ -159,7 +134,10 @@ impl ProximityWeight {
                     .map(|_| fieldnorms.into_boxed_slice()),
             };
 
-            Ok(vec![Box::new(loaded_postings)])
+            Ok(ProxSide {
+                postings: vec![Box::new(postings)],
+                inner: Some(matches),
+            })
         } else {
             let mut postings: Vec<Box<dyn Postings>> = Vec::new();
             let mut num_regex_terms = 0;
@@ -204,7 +182,10 @@ impl ProximityWeight {
                     }
                 }
             }
-            Ok(postings)
+            Ok(ProxSide {
+                postings,
+                inner: None,
+            })
         }
     }
 }

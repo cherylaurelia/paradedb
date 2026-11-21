@@ -22,6 +22,58 @@ use tantivy::postings::Postings;
 use tantivy::query::{Bm25Weight, Intersection, Scorer, SimpleUnion};
 use tantivy::{DocId, DocSet, Score, TERMINATED};
 
+/// First..last token of one side of a match (a term is a span of one).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Span {
+    pub start: u32,
+    pub end: u32,
+}
+
+impl Span {
+    fn at(pos: u32) -> Self {
+        Span {
+            start: pos,
+            end: pos,
+        }
+    }
+
+    pub fn cover(self, other: Span) -> Self {
+        Span {
+            start: self.start.min(other.start),
+            end: self.end.max(other.end),
+        }
+    }
+}
+
+/// An inner clause's matches: sorted, deduplicated spans per doc, in doc id order.
+#[derive(Default)]
+pub struct InnerMatches {
+    pub doc_ids: Vec<DocId>,
+    pub offsets: Vec<u32>,
+    pub spans: Vec<Span>,
+}
+
+impl InnerMatches {
+    fn spans_for(&self, doc: DocId) -> &[Span] {
+        match self.doc_ids.binary_search(&doc) {
+            Ok(i) => &self.spans[self.offsets[i] as usize..self.offsets[i + 1] as usize],
+            Err(_) => &[],
+        }
+    }
+}
+
+/// One side of a clause; `inner` holds the spans when the side is an inner proximity clause.
+pub struct ProxSide {
+    pub postings: Vec<Box<dyn Postings>>,
+    pub inner: Option<InnerMatches>,
+}
+
+impl ProxSide {
+    pub fn is_empty(&self) -> bool {
+        self.postings.is_empty() || self.inner.as_ref().is_some_and(|m| m.doc_ids.is_empty())
+    }
+}
+
 pub struct ProximityScorer {
     #[allow(clippy::type_complexity)]
     intersection: Intersection<SimpleUnion<Box<dyn Postings>>, SimpleUnion<Box<dyn Postings>>>,
@@ -31,19 +83,30 @@ pub struct ProximityScorer {
     nmatches: usize,
     lpos: Vec<u32>,
     rpos: Vec<u32>,
+    left_inner: Option<InnerMatches>,
+    right_inner: Option<InnerMatches>,
+    all_pairs: bool,
+    lspans: Vec<Span>,
+    rspans: Vec<Span>,
+    span_matches: Vec<(Span, Span)>,
 }
 
 impl ProximityScorer {
+    /// `all_pairs` returns every matching pair: an inner clause needs each one as a span.
     pub fn new(
-        left: Vec<Box<dyn Postings>>,
+        left: ProxSide,
         distance: ProximityDistance,
-        right: Vec<Box<dyn Postings>>,
+        right: ProxSide,
         fieldnorm_reader: FieldNormReader,
         weight_opt: Option<Bm25Weight>,
         num_docs: u32,
+        all_pairs: bool,
     ) -> Self {
-        let left = SimpleUnion::build(left);
-        let right = SimpleUnion::build(right);
+        let all_pairs = all_pairs || left.inner.is_some() || right.inner.is_some();
+        let left_inner = left.inner;
+        let right_inner = right.inner;
+        let left = SimpleUnion::build(left.postings);
+        let right = SimpleUnion::build(right.postings);
         let intersection = Intersection::with_two_sets(left, right, num_docs);
         let mut scorer = Self {
             intersection,
@@ -53,6 +116,12 @@ impl ProximityScorer {
             nmatches: 0,
             lpos: Default::default(),
             rpos: Default::default(),
+            left_inner,
+            right_inner,
+            all_pairs,
+            lspans: Default::default(),
+            rspans: Default::default(),
+            span_matches: Default::default(),
         };
 
         if scorer.doc() != TERMINATED && !scorer.prox_match() {
@@ -69,16 +138,41 @@ impl ProximityScorer {
             .unwrap_or_else(|| self.fieldnorm_reader.fieldnorm_id(self.doc()))
     }
 
-    pub fn prox_iter(&mut self) -> impl Iterator<Item = (u32, u32)> + '_ {
-        self.lpos.clear();
-        self.rpos.clear();
-        self.intersection
-            .docset_mut_specialized(0)
-            .positions(&mut self.lpos);
-        self.intersection
-            .docset_mut_specialized(1)
-            .positions(&mut self.rpos);
-        ProxIter::new(self.distance, &self.lpos, &self.rpos)
+    pub fn prox_iter(&mut self) -> impl Iterator<Item = (Span, Span)> + '_ {
+        if !self.all_pairs {
+            self.lpos.clear();
+            self.rpos.clear();
+            self.intersection
+                .docset_mut_specialized(0)
+                .positions(&mut self.lpos);
+            self.intersection
+                .docset_mut_specialized(1)
+                .positions(&mut self.rpos);
+            return MatchIter::Positions(ProxIter::new(self.distance, &self.lpos, &self.rpos));
+        }
+
+        let doc = self.doc();
+        fill_spans(
+            &mut self.lspans,
+            &mut self.lpos,
+            self.left_inner.as_ref(),
+            self.intersection.docset_mut_specialized(0),
+            doc,
+        );
+        fill_spans(
+            &mut self.rspans,
+            &mut self.rpos,
+            self.right_inner.as_ref(),
+            self.intersection.docset_mut_specialized(1),
+            doc,
+        );
+        match_spans(
+            self.distance,
+            &self.lspans,
+            &self.rspans,
+            &mut self.span_matches,
+        );
+        MatchIter::Spans(self.span_matches.iter())
     }
 
     pub fn prox_count(&mut self) -> usize {
@@ -94,6 +188,62 @@ impl ProximityScorer {
             count > 0
         } else {
             iter.next().is_some()
+        }
+    }
+}
+
+fn fill_spans(
+    spans: &mut Vec<Span>,
+    positions: &mut Vec<u32>,
+    inner: Option<&InnerMatches>,
+    postings: &mut SimpleUnion<Box<dyn Postings>>,
+    doc: DocId,
+) {
+    spans.clear();
+    match inner {
+        Some(inner) => spans.extend_from_slice(inner.spans_for(doc)),
+        None => {
+            positions.clear();
+            postings.positions(positions);
+            spans.extend(positions.iter().map(|&pos| Span::at(pos)));
+        }
+    }
+}
+
+/// Every (left, right) pair within `distance`; `right` is sorted by start.
+fn match_spans(
+    distance: ProximityDistance,
+    left: &[Span],
+    right: &[Span],
+    out: &mut Vec<(Span, Span)>,
+) {
+    out.clear();
+    let max_gap = distance.distance().saturating_add(1);
+    let widest_right = right.iter().map(|r| r.end - r.start).max().unwrap_or(0);
+    for &l in left {
+        let lo = l.start.saturating_sub(max_gap.saturating_add(widest_right));
+        let hi = l.end.saturating_add(max_gap);
+        let first = right.partition_point(|r| r.start < lo);
+        for &r in right[first..].iter().take_while(|r| r.start <= hi) {
+            if distance.span_gap(l, r).is_some_and(|gap| gap <= max_gap) {
+                out.push((l, r));
+            }
+        }
+    }
+}
+
+enum MatchIter<'a> {
+    Positions(ProxIter<'a>),
+    Spans(std::slice::Iter<'a, (Span, Span)>),
+}
+
+impl Iterator for MatchIter<'_> {
+    type Item = (Span, Span);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            MatchIter::Positions(iter) => iter.next().map(|(l, r)| (Span::at(l), Span::at(r))),
+            MatchIter::Spans(iter) => iter.next().copied(),
         }
     }
 }

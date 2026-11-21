@@ -1,0 +1,5 @@
+---
+header: stability
+---
+
+- Fixed nested and chained proximity queries (e.g. `'a' ##1## 'b' ##0## 'c'`) matching a term that sits inside the inner match: the inner clause now counts as one span, from its first to its last token.

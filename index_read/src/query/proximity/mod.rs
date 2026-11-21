@@ -22,6 +22,7 @@ mod weight;
 pub use pdb::*;
 #[pgrx::pg_schema]
 mod pdb {
+    use super::scorer::Span;
     use crate::api::Regex;
     use pgrx::{InOutFuncs, PostgresType, StringInfo};
     use serde::{Deserialize, Serialize};
@@ -184,6 +185,18 @@ mod pdb {
             match self {
                 ProximityDistance::InOrder(_) => r.wrapping_sub(l),
                 ProximityDistance::AnyOrder(_) => r.abs_diff(l),
+            }
+        }
+
+        /// Gap between the nearest ends, or `None` if out of order or overlapping.
+        #[inline(always)]
+        pub(crate) fn span_gap(&self, l: Span, r: Span) -> Option<u32> {
+            if r.start >= l.end {
+                Some(r.start - l.end)
+            } else if !self.in_order() && l.start >= r.end {
+                Some(l.start - r.end)
+            } else {
+                None
             }
         }
 
